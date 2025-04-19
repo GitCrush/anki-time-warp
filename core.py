@@ -95,6 +95,7 @@ def count_remaining_new_cards(deck_name, tags=None):
 
 def apply_transformed_due_dates(card_data, horizon_past=30):
     today = mw.col.sched.today
+    undo_entry = mw.col.add_custom_undo_entry("due dates time warp")
     for card_info in card_data:
         card = mw.col.get_card(card_info["cid"])
         timeline = card_info.get("review_timeline", [])
@@ -106,6 +107,7 @@ def apply_transformed_due_dates(card_data, horizon_past=30):
             new_due = today + (index - horizon_past)
             card.due = new_due
             mw.col.update_card(card)
+            mw.col.merge_undo_entries(undo_entry)
         except ValueError:
             continue
 
