@@ -209,7 +209,9 @@ def launch_timewarp():
             reply = QMessageBox.question(
                 dialog,
                 "Review Changes",
-                "You are about to introduce permanent changes into the review data of the selected deck. Proceed?",
+                "You are about to introduce changes into the review data of the selected deck. You"
+                " can undo the changes (Edit > Undo time warp) but they become permanent once you"
+                " sync. Proceed?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
