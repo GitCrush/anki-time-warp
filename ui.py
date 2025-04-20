@@ -209,7 +209,8 @@ def launch_timewarp():
             reply = QMessageBox.question(
                 dialog,
                 "Review Changes",
-                "You are about to introduce permanent changes into the review data of the selected deck. Proceed?",
+                "You are about to introduce changes into the review data of the selected deck."
+                " Undoing the changes is possible until you sync. Proceed?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
@@ -219,7 +220,11 @@ def launch_timewarp():
                 if checkbox_set_new.isChecked():
                     set_cards_as_new(card_data_transformed)
                 mw.reset()
-                QMessageBox.information(dialog, "Success", "Review dates have been updated.")
+                QMessageBox.information(
+                    dialog,
+                    "Success",
+                    "Review dates have been updated. Undo from (Edit > Undo Time Warp)",
+                )
 
         elif mode == "Create filtered deck":
             reply = QMessageBox.question(
