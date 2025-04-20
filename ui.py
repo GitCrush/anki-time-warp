@@ -1,9 +1,9 @@
 from aqt import mw
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider, QPushButton,
-    QCheckBox, QMessageBox, QSizePolicy
+    QCheckBox, QMessageBox, QSizePolicy, QScrollArea, QWidget
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
@@ -12,10 +12,12 @@ from .core import (
     compute_due_matrix, sum_matrix_columns, apply_transformed_due_dates
 )
 from .tag_input_widget import TagInputWidget
-from datetime import date, timedelta
+from datetime import date
 import os
-from .core import shuffle_new_cards, set_all_to_new
+from .core import shuffle_new_cards as shuffle_cards, set_all_to_new as set_cards_as_new
 
+# Prevent multiple instances
+dialog_instance = None
 
 def build_chart_html(hist, labels):
     chart_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "chart.min.js"))
@@ -26,12 +28,21 @@ def build_chart_html(hist, labels):
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
+    <meta charset=\"UTF-8\">
     <title>Time Warp Graph</title>
     <script>{chartjs}</script>
+    <style>
+        body {{
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+        }}
+    </style>
 </head>
-<body style="margin:0;">
-<canvas id="timeWarpChart" style="width:100%; height:100vh;"></canvas>
+<body>
+<canvas id=\"timeWarpChart\" width=\"1000\" height=\"400\"></canvas>
 <script>
 const ctx = document.getElementById('timeWarpChart').getContext('2d');
 new Chart(ctx, {{
@@ -47,17 +58,31 @@ new Chart(ctx, {{
                     const label = context.chart.data.labels[index];
                     return parseInt(label) < 0 ? 'rgba(255, 0, 0, 0.8)' : 'rgba(0, 123, 255, 0.8)';
                 }},
-                barThickness: 12
+                barThickness: 10
             }}
         ]
     }},
     options: {{
-        responsive: true,
+        responsive: false,
         maintainAspectRatio: false,
+        plugins: {{
+            tooltip: {{
+                callbacks: {{
+                    label: function(context) {{
+                        const value = context.raw;
+                        const day = context.label;
+                        return `${{value}} cards due on Day ${{day}}`;
+                    }}
+                }}
+            }}
+        }},
         scales: {{
             y: {{
                 beginAtZero: true,
-                title: {{ display: true, text: 'Cards Due' }}
+                title: {{
+                    display: true,
+                    text: 'Cards Due'
+                }}
             }}
         }}
     }}
@@ -78,36 +103,66 @@ def create_filtered_deck_from_transformed(card_data):
     mw.col.decks.save(deck_id)
     mw.col.sched.rebuild_filtered_deck(deck_id)
 
+def clear_dialog_instance():
+    global dialog_instance
+    dialog_instance = None
+
 def launch_timewarp():
+    global dialog_instance
+    if dialog_instance is not None and dialog_instance.isVisible():
+        dialog_instance.raise_()
+        dialog_instance.activateWindow()
+        return
+
     card_data_transformed = []
 
-    dialog = QDialog()
-    dialog.setWindowTitle("Anki Time Warp")
-    dialog.setSizeGripEnabled(True)
-    layout = QVBoxLayout(dialog) 
-    logo_label = QLabel()
-    
-    addon_dir = os.path.dirname(__file__)
-    logo_path = os.path.join(addon_dir, "logo.png")
+    dialog_instance = QDialog()
+    dialog_instance.setWindowTitle("Anki Time Warp")
+    dialog_instance.setSizeGripEnabled(True)
+    screen_geometry = mw.app.primaryScreen().availableGeometry()
+    dialog_instance.resize(1000, int(screen_geometry.height() * 0.95))
+    main_layout = QVBoxLayout(dialog_instance)
 
-    pixmap = QPixmap(logo_path)
-    if not pixmap.isNull():
-       pixmap = pixmap.scaled(100, 100)
-       logo_label.setPixmap(pixmap)
-    logo_label.setFixedSize(100, 100)
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_content = QWidget()
+    scroll_content.setMaximumWidth(1000)
+    scroll_content.setMinimumWidth(1000)
+    scroll_content.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+    scroll_layout = QVBoxLayout(scroll_content)
 
-    logo_layout = QHBoxLayout()
-    logo_layout.addStretch()
-    logo_layout.addWidget(logo_label)
+    top_layout = QHBoxLayout()
+    deck_tag_container = QVBoxLayout()
 
-    layout.addLayout(logo_layout)
-
-
+    deck_select_label = QLabel("Select Deck:")
     deck_select = QComboBox()
     deck_names = ["All"] + [d.name for d in mw.col.decks.all_names_and_ids()]
     deck_select.addItems(deck_names)
+    deck_select.setFixedWidth(800)
 
+    tag_widget_label = QLabel("Tags:")
     tag_widget = TagInputWidget(mw.col.tags.all())
+    tag_widget.setFixedWidth(800)
+
+    deck_tag_container.addWidget(deck_select_label)
+    deck_tag_container.addWidget(deck_select)
+    deck_tag_container.addWidget(tag_widget_label)
+    deck_tag_container.addWidget(tag_widget)
+
+    top_layout.addLayout(deck_tag_container)
+
+    logo_label = QLabel()
+    addon_dir = os.path.dirname(__file__)
+    logo_path = os.path.join(addon_dir, "logo.png")
+    pixmap = QPixmap(logo_path)
+    if not pixmap.isNull():
+        pixmap = pixmap.scaled(100, 100)
+        logo_label.setPixmap(pixmap)
+    logo_label.setFixedSize(100, 100)
+    top_layout.addStretch()
+    top_layout.addWidget(logo_label)
+
+    scroll_layout.addLayout(top_layout)
 
     slider_stretch = QSlider(Qt.Orientation.Horizontal)
     slider_stretch.setMinimum(-100)
@@ -135,28 +190,27 @@ def launch_timewarp():
     preview_btn = QPushButton("Preview")
     apply_changes_btn = QPushButton("Apply Changes")
 
-    webview = QWebEngineView()
-    webview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    scroll_layout.addWidget(slider_stretch_label)
+    scroll_layout.addWidget(slider_stretch)
+    scroll_layout.addWidget(slider_shift_label)
+    scroll_layout.addWidget(slider_shift)
+    scroll_layout.addWidget(checkbox_collapse_overdues)
+    scroll_layout.addWidget(checkbox_shuffle)
+    scroll_layout.addWidget(checkbox_set_new)
+    scroll_layout.addWidget(reset_btn)
+    scroll_layout.addWidget(card_count_label)
+    scroll_layout.addWidget(review_count_label)
+    scroll_layout.addWidget(QLabel("Select Export Mode:"))
+    scroll_layout.addWidget(export_mode_select)
+    scroll_layout.addWidget(preview_btn)
+    scroll_layout.addWidget(apply_changes_btn)
 
-    layout.addWidget(QLabel("Select Deck:"))
-    layout.addWidget(deck_select)
-    layout.addWidget(QLabel("Tags:"))
-    layout.addWidget(tag_widget)
-    layout.addWidget(slider_stretch_label)
-    layout.addWidget(slider_stretch)
-    layout.addWidget(slider_shift_label)
-    layout.addWidget(slider_shift)
-    layout.addWidget(checkbox_collapse_overdues)
-    layout.addWidget(checkbox_shuffle)
-    layout.addWidget(checkbox_set_new)
-    layout.addWidget(reset_btn)
-    layout.addWidget(card_count_label)
-    layout.addWidget(review_count_label)
-    layout.addWidget(QLabel("Select Export Mode:"))
-    layout.addWidget(export_mode_select)
-    layout.addWidget(preview_btn)
-    layout.addWidget(apply_changes_btn)
-    layout.addWidget(webview)
+    scroll_area.setWidget(scroll_content)
+    main_layout.addWidget(scroll_area)
+
+    webview = QWebEngineView()
+    webview.setFixedSize(1000, 400)
+    main_layout.addWidget(webview)
 
     def update_labels():
         slider_stretch_label.setText(f"Stretch: {slider_stretch.value()}%")
@@ -195,7 +249,6 @@ def launch_timewarp():
         today = date.today()
         mode = export_mode_select.currentText()
 
-        # Prepare debug output
         changes_preview = []
         for entry in card_data_transformed:
             original = entry["original_due"]
@@ -207,7 +260,7 @@ def launch_timewarp():
 
         if mode == "Write to current deck":
             reply = QMessageBox.question(
-                dialog,
+                dialog_instance,
                 "Review Changes",
                 "You are about to introduce changes into the review data of the selected deck."
                 " Undoing the changes is possible until you sync. Proceed?",
@@ -221,14 +274,14 @@ def launch_timewarp():
                     set_cards_as_new(card_data_transformed)
                 mw.reset()
                 QMessageBox.information(
-                    dialog,
+                    dialog_instance,
                     "Success",
                     "Review dates have been updated. Undo from (Edit > Undo Time Warp)",
                 )
 
         elif mode == "Create filtered deck":
             reply = QMessageBox.question(
-                dialog,
+                dialog_instance,
                 "Filtered Deck",
                 "Reviewing cards in the filtered deck will introduce permanent changes in their review timeline. Proceed?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -240,7 +293,7 @@ def launch_timewarp():
                 if checkbox_set_new.isChecked():
                     set_cards_as_new(card_data_transformed)
                 mw.reset()
-                QMessageBox.information(dialog, "Filtered Deck Created", "Filtered deck with transformed due dates has been created.")
+                QMessageBox.information(dialog_instance, "Filtered Deck Created", "Filtered deck with transformed due dates has been created.")
 
     def reset_sliders():
         slider_stretch.setValue(0)
@@ -256,7 +309,6 @@ def launch_timewarp():
     reset_btn.clicked.connect(reset_sliders)
     apply_changes_btn.clicked.connect(apply_changes)
 
-    dialog.setLayout(layout)
-    dialog.resize(1000, 900)
-    dialog.exec()
-
+    dialog_instance.setLayout(main_layout)
+    dialog_instance.finished.connect(lambda: clear_dialog_instance())
+    dialog_instance.exec()
