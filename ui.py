@@ -1,9 +1,9 @@
 from aqt import mw
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider, QPushButton,
-    QCheckBox, QMessageBox, QSizePolicy, QScrollArea, QWidget
+    QCheckBox, QMessageBox, QSizePolicy, QScrollArea, QWidget, QSpinBox
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
@@ -19,16 +19,31 @@ from .core import shuffle_new_cards as shuffle_cards, set_all_to_new as set_card
 # Prevent multiple instances
 dialog_instance = None
 
-def build_chart_html(hist, labels):
+def build_chart_html(hist, labels, max_cap=0, y_max=None):
     chart_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "chart.min.js"))
     with open(chart_path, "r", encoding="utf-8") as f:
         chartjs = f.read()
+
+    # Build a flat line for the cap (if any)
+    cap_js_dataset = ""
+    if max_cap and int(max_cap) > 0:
+        cap_values = ",".join([str(int(max_cap)) for _ in range(len(labels))])
+        cap_js_dataset = f""",
+            {{
+                type: 'line',
+                label: 'Cap',
+                data: [{cap_values}],
+                borderDash: [6,4],
+                fill: false,
+                pointRadius: 0,
+                borderWidth: 1
+            }}"""
 
     return f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset=\"UTF-8\">
+    <meta charset="UTF-8">
     <title>Time Warp Graph</title>
     <script>{chartjs}</script>
     <style>
@@ -37,12 +52,18 @@ def build_chart_html(hist, labels):
             display: flex;
             align-items: center;
             justify-content: center;
-            height: 100%;
+            height: 100vh;
+        }}
+        #container {{
+            width: 1000px;
+            height: 400px;
         }}
     </style>
 </head>
 <body>
-<canvas id=\"timeWarpChart\" width=\"1000\" height=\"400\"></canvas>
+<div id="container">
+<canvas id="timeWarpChart" width="1000" height="400"></canvas>
+</div>
 <script>
 const ctx = document.getElementById('timeWarpChart').getContext('2d');
 new Chart(ctx, {{
@@ -60,6 +81,7 @@ new Chart(ctx, {{
                 }},
                 barThickness: 10
             }}
+            {cap_js_dataset}
         ]
     }},
     options: {{
@@ -77,12 +99,18 @@ new Chart(ctx, {{
             }}
         }},
         scales: {{
-            y: {{
-                beginAtZero: true,
+            x: {{
                 title: {{
                     display: true,
-                    text: 'Cards Due'
+                    text: 'Day Offset (0 = Today)'
                 }}
+            }},
+            y: {{
+                title: {{
+                    display: true,
+                    text: 'Number of Cards'
+                }},
+                beginAtZero: true{', max: ' + str(y_max) if y_max else ''}
             }}
         }}
     }}
@@ -91,6 +119,7 @@ new Chart(ctx, {{
 </body>
 </html>
 """
+
 
 def create_filtered_deck_from_transformed(card_data):
     deck_name = "TimeWarpFiltered"
@@ -115,6 +144,7 @@ def launch_timewarp():
         return
 
     card_data_transformed = []
+    chart_y_max = [0]  # mutable container so inner function can update
 
     dialog_instance = QDialog()
     dialog_instance.setWindowTitle("Anki Time Warp")
@@ -180,6 +210,13 @@ def launch_timewarp():
     checkbox_shuffle = QCheckBox("Shuffle new cards on export")
     checkbox_set_new = QCheckBox("Set all cards to new")
 
+    # 0 = auto-level (flatten to average), -1 = unlimited, >0 = manual cap
+    max_per_day_label = QLabel("Max cards/day:")
+    max_per_day_spin = QSpinBox()
+    max_per_day_spin.setRange(-1, 100000)
+    max_per_day_spin.setValue(-1)
+    max_per_day_spin.setToolTip("-1 = off (stretch controls distribution).\n0 = auto-flatten.\n>0 = manual cap per day.")
+
     card_count_label = QLabel("Cards in scope: 0")
     review_count_label = QLabel("Cards currently in review: 0")
 
@@ -197,6 +234,8 @@ def launch_timewarp():
     scroll_layout.addWidget(checkbox_collapse_overdues)
     scroll_layout.addWidget(checkbox_shuffle)
     scroll_layout.addWidget(checkbox_set_new)
+    scroll_layout.addWidget(max_per_day_label)
+    scroll_layout.addWidget(max_per_day_spin)
     scroll_layout.addWidget(reset_btn)
     scroll_layout.addWidget(card_count_label)
     scroll_layout.addWidget(review_count_label)
@@ -212,37 +251,68 @@ def launch_timewarp():
     webview.setFixedSize(1000, 400)
     main_layout.addWidget(webview)
 
+    # FIX 3: debounce timer – chart only redraws after 200ms of inactivity
+    debounce_timer = QTimer()
+    debounce_timer.setSingleShot(True)
+    debounce_timer.setInterval(200)
+
     def update_labels():
         slider_stretch_label.setText(f"Stretch: {slider_stretch.value()}%")
         slider_shift_label.setText(f"Shift: {slider_shift.value()} days")
 
+    def schedule_update():
+        """Reset the debounce timer on every parameter change."""
+        debounce_timer.start()
+
     def update_graph():
         nonlocal card_data_transformed
+
         horizon_past = 30
         horizon_future = 90
-        total_horizon = horizon_past + horizon_future
 
         deck = deck_select.currentText()
         tags = tag_widget.get_tags()
         stretch = slider_stretch.value()
         shift = slider_shift.value()
         collapse_overdues = checkbox_collapse_overdues.isChecked()
+        max_cap = int(max_per_day_spin.value())
 
         cids = fetch_cards(deck, tags)
         card_count_label.setText(f"Cards in scope: {len(cids)}")
-
         card_data = get_card_data(cids)
+
         card_data_transformed = simulate_review_timeline(
-            card_data, stretch_pct=stretch, shift=shift,
-            horizon_past=horizon_past, horizon_future=horizon_future,
-            collapse_overdues=collapse_overdues
+            card_data,
+            stretch_pct=stretch,
+            shift=shift,
+            horizon_past=horizon_past,
+            horizon_future=horizon_future,
+            collapse_overdues=collapse_overdues,
+            max_cards_per_day=max_cap,
         )
-        matrix_transformed = compute_due_matrix(card_data_transformed, total_horizon)
+
+        matrix_transformed = compute_due_matrix(card_data_transformed, 0)
         hist_transformed = sum_matrix_columns(matrix_transformed)
         review_count_label.setText(f"Cards currently in review: {sum(hist_transformed)}")
 
-        labels = [str(i - horizon_past) for i in range(total_horizon)]
-        html = build_chart_html(hist_transformed, labels)
+        # Chart: always show base horizon, stable Y-axis
+        base_horizon = horizon_past + horizon_future
+        chart_hist = hist_transformed[:base_horizon]
+        while len(chart_hist) < base_horizon:
+            chart_hist.append(0)
+
+        # Y-axis stability: only rescale upward when peak > 75% of current max
+        current_peak = max(chart_hist) if chart_hist else 0
+        if chart_y_max[0] == 0:
+            # First render: set y_max to peak with 10% headroom
+            chart_y_max[0] = max(1, int(current_peak * 1.1))
+        elif current_peak > chart_y_max[0] * 0.75:
+            # Peak grew beyond 75% of Y-axis: rescale up
+            chart_y_max[0] = max(chart_y_max[0], int(current_peak * 1.1))
+        # Otherwise: keep current y_max (bars shrink within stable axis)
+
+        labels = [str(i - horizon_past) for i in range(base_horizon)]
+        html = build_chart_html(chart_hist, labels, max_cap=max_cap, y_max=chart_y_max[0])
         webview.setHtml(html)
 
     def apply_changes():
@@ -298,14 +368,19 @@ def launch_timewarp():
     def reset_sliders():
         slider_stretch.setValue(0)
         slider_shift.setValue(0)
+        chart_y_max[0] = 0  # reset Y-axis on next render
+
+    # FIX 3: sliders trigger debounced update, not direct
+    debounce_timer.timeout.connect(update_graph)
 
     slider_stretch.valueChanged.connect(update_labels)
     slider_shift.valueChanged.connect(update_labels)
-    slider_stretch.valueChanged.connect(update_graph)
-    slider_shift.valueChanged.connect(update_graph)
-    deck_select.currentIndexChanged.connect(update_graph)
-    checkbox_collapse_overdues.stateChanged.connect(update_graph)
-    preview_btn.clicked.connect(update_graph)
+    slider_stretch.valueChanged.connect(schedule_update)
+    slider_shift.valueChanged.connect(schedule_update)
+    max_per_day_spin.valueChanged.connect(schedule_update)
+    deck_select.currentIndexChanged.connect(lambda: (chart_y_max.__setitem__(0, 0), schedule_update()))
+    checkbox_collapse_overdues.stateChanged.connect(schedule_update)
+    preview_btn.clicked.connect(update_graph)       # Preview = immediate
     reset_btn.clicked.connect(reset_sliders)
     apply_changes_btn.clicked.connect(apply_changes)
 
