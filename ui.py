@@ -1,6 +1,6 @@
 from aqt import mw
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSlider, QPushButton,
     QCheckBox, QMessageBox, QSizePolicy, QScrollArea, QWidget, QSpinBox
@@ -8,23 +8,26 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from .core import (
-    fetch_cards, get_card_data, simulate_review_timeline,
-    compute_due_matrix, sum_matrix_columns, apply_transformed_due_dates
+    fetch_cards, get_card_data, oldest_review_due, simulate_review_timeline,
+    timeline_histogram, apply_transformed_due_dates
 )
 from .tag_input_widget import TagInputWidget
-from datetime import date
 import os
-from .core import shuffle_new_cards as shuffle_cards, set_all_to_new as set_cards_as_new
+
+# Fixed part of the horizon; the past part grows with the oldest overdue card.
+MIN_HORIZON_PAST = 30
+HORIZON_FUTURE = 90
+SHIFT_LIMIT = 365
 
 # Prevent multiple instances
 dialog_instance = None
+
 
 def build_chart_html(hist, labels, max_cap=0, y_max=None):
     chart_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "chart.min.js"))
     with open(chart_path, "r", encoding="utf-8") as f:
         chartjs = f.read()
 
-    # Build a flat line for the cap (if any)
     cap_js_dataset = ""
     if max_cap and int(max_cap) > 0:
         cap_values = ",".join([str(int(max_cap)) for _ in range(len(labels))])
@@ -72,14 +75,17 @@ new Chart(ctx, {{
         labels: {labels},
         datasets: [
             {{
-                label: 'Overdue',
+                label: 'Cards',
                 data: {hist},
                 backgroundColor: function(context) {{
                     const index = context.dataIndex;
                     const label = context.chart.data.labels[index];
                     return parseInt(label) < 0 ? 'rgba(255, 0, 0, 0.8)' : 'rgba(0, 123, 255, 0.8)';
                 }},
-                barThickness: 10
+                barThickness: 'flex',
+                maxBarThickness: 10,
+                categoryPercentage: 1.0,
+                barPercentage: 0.8
             }}
             {cap_js_dataset}
         ]
@@ -87,7 +93,9 @@ new Chart(ctx, {{
     options: {{
         responsive: false,
         maintainAspectRatio: false,
+        animation: false,
         plugins: {{
+            legend: {{ display: false }},
             tooltip: {{
                 callbacks: {{
                     label: function(context) {{
@@ -103,7 +111,8 @@ new Chart(ctx, {{
                 title: {{
                     display: true,
                     text: 'Day Offset (0 = Today)'
-                }}
+                }},
+                ticks: {{ autoSkip: true, maxTicksLimit: 40, maxRotation: 0 }}
             }},
             y: {{
                 title: {{
@@ -121,20 +130,28 @@ new Chart(ctx, {{
 """
 
 
-def create_filtered_deck_from_transformed(card_data):
-    deck_name = "TimeWarpFiltered"
-    deck_id = mw.col.decks.id(deck_name)
-    mw.col.decks.select(deck_id)
-    mw.col.sched.unbury_cards()
-    mw.col.decks.get(deck_id)["dyn"] = True
-    mw.col.decks.get(deck_id)["terms"] = [[1, "cid:" + " OR cid:".join(str(card["cid"]) for card in card_data), 0]]
-    mw.col.decks.get(deck_id)["resched"] = True
-    mw.col.decks.save(deck_id)
-    mw.col.sched.rebuild_filtered_deck(deck_id)
-
 def clear_dialog_instance():
     global dialog_instance
     dialog_instance = None
+
+
+def _slider_with_spinbox(minimum, maximum, suffix):
+    """Horizontal slider + spinbox kept in sync; returns (layout, slider, spin)."""
+    slider = QSlider(Qt.Orientation.Horizontal)
+    slider.setRange(minimum, maximum)
+    slider.setValue(0)
+    spin = QSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setValue(0)
+    spin.setSuffix(suffix)
+    spin.setFixedWidth(110)
+    slider.valueChanged.connect(spin.setValue)
+    spin.valueChanged.connect(slider.setValue)
+    row = QHBoxLayout()
+    row.addWidget(slider)
+    row.addWidget(spin)
+    return row, slider, spin
+
 
 def launch_timewarp():
     global dialog_instance
@@ -143,8 +160,12 @@ def launch_timewarp():
         dialog_instance.activateWindow()
         return
 
-    card_data_transformed = []
-    chart_y_max = [0]  # mutable container so inner function can update
+    # State shared between the closures below
+    state = {
+        "card_data": [],
+        "horizon_past": MIN_HORIZON_PAST,
+        "y_max": 0,
+    }
 
     dialog_instance = QDialog()
     dialog_instance.setWindowTitle("Anki Time Warp")
@@ -194,21 +215,13 @@ def launch_timewarp():
 
     scroll_layout.addLayout(top_layout)
 
-    slider_stretch = QSlider(Qt.Orientation.Horizontal)
-    slider_stretch.setMinimum(-100)
-    slider_stretch.setMaximum(500)
-    slider_stretch.setValue(0)
-    slider_stretch_label = QLabel("Stretch: 0%")
+    stretch_label = QLabel("Stretch (+ flattens toward an even load, − compresses toward today):")
+    stretch_row, slider_stretch, spin_stretch = _slider_with_spinbox(-100, 500, " %")
 
-    slider_shift = QSlider(Qt.Orientation.Horizontal)
-    slider_shift.setMinimum(-30)
-    slider_shift.setMaximum(30)
-    slider_shift.setValue(0)
-    slider_shift_label = QLabel("Shift: 0 days")
+    shift_label = QLabel("Shift (move the whole schedule; + = later):")
+    shift_row, slider_shift, spin_shift = _slider_with_spinbox(-SHIFT_LIMIT, SHIFT_LIMIT, " days")
 
     checkbox_collapse_overdues = QCheckBox("Collapse overdues to T0")
-    checkbox_shuffle = QCheckBox("Shuffle new cards on export")
-    checkbox_set_new = QCheckBox("Set all cards to new")
 
     # 0 = auto-level (flatten to average), -1 = unlimited, >0 = manual cap
     max_per_day_label = QLabel("Max cards/day:")
@@ -218,29 +231,24 @@ def launch_timewarp():
     max_per_day_spin.setToolTip("-1 = off (stretch controls distribution).\n0 = auto-flatten.\n>0 = manual cap per day.")
 
     card_count_label = QLabel("Cards in scope: 0")
-    review_count_label = QLabel("Cards currently in review: 0")
-
-    export_mode_select = QComboBox()
-    export_mode_select.addItems(["Write to current deck", "Create filtered deck"])
+    review_count_label = QLabel("Review cards: 0")
+    overdue_info_label = QLabel("")
 
     reset_btn = QPushButton("Reset Sliders")
     preview_btn = QPushButton("Preview")
     apply_changes_btn = QPushButton("Apply Changes")
 
-    scroll_layout.addWidget(slider_stretch_label)
-    scroll_layout.addWidget(slider_stretch)
-    scroll_layout.addWidget(slider_shift_label)
-    scroll_layout.addWidget(slider_shift)
+    scroll_layout.addWidget(stretch_label)
+    scroll_layout.addLayout(stretch_row)
+    scroll_layout.addWidget(shift_label)
+    scroll_layout.addLayout(shift_row)
     scroll_layout.addWidget(checkbox_collapse_overdues)
-    scroll_layout.addWidget(checkbox_shuffle)
-    scroll_layout.addWidget(checkbox_set_new)
     scroll_layout.addWidget(max_per_day_label)
     scroll_layout.addWidget(max_per_day_spin)
     scroll_layout.addWidget(reset_btn)
     scroll_layout.addWidget(card_count_label)
     scroll_layout.addWidget(review_count_label)
-    scroll_layout.addWidget(QLabel("Select Export Mode:"))
-    scroll_layout.addWidget(export_mode_select)
+    scroll_layout.addWidget(overdue_info_label)
     scroll_layout.addWidget(preview_btn)
     scroll_layout.addWidget(apply_changes_btn)
 
@@ -251,25 +259,20 @@ def launch_timewarp():
     webview.setFixedSize(1000, 400)
     main_layout.addWidget(webview)
 
-    # FIX 3: debounce timer – chart only redraws after 200ms of inactivity
+    # Debounce: chart only redraws after 200 ms of inactivity
     debounce_timer = QTimer()
     debounce_timer.setSingleShot(True)
     debounce_timer.setInterval(200)
 
-    def update_labels():
-        slider_stretch_label.setText(f"Stretch: {slider_stretch.value()}%")
-        slider_shift_label.setText(f"Shift: {slider_shift.value()} days")
-
     def schedule_update():
-        """Reset the debounce timer on every parameter change."""
         debounce_timer.start()
 
+    def reset_y_axis_and_update():
+        state["y_max"] = 0
+        schedule_update()
+
     def update_graph():
-        nonlocal card_data_transformed
-
-        horizon_past = 30
-        horizon_future = 90
-
+        today = mw.col.sched.today
         deck = deck_select.currentText()
         tags = tag_widget.get_tags()
         stretch = slider_stretch.value()
@@ -281,104 +284,97 @@ def launch_timewarp():
         card_count_label.setText(f"Cards in scope: {len(cids)}")
         card_data = get_card_data(cids)
 
-        card_data_transformed = simulate_review_timeline(
+        # Past horizon grows so that the oldest overdue card still fits.
+        oldest = oldest_review_due(card_data)
+        horizon_past = MIN_HORIZON_PAST
+        if oldest is not None:
+            horizon_past = max(MIN_HORIZON_PAST, today - oldest + 1)
+        state["horizon_past"] = horizon_past
+
+        n_review = sum(1 for c in card_data if c["type"] == "review")
+        n_overdue = sum(1 for c in card_data if c["type"] == "review" and c["due"] < today)
+
+        state["card_data"] = simulate_review_timeline(
             card_data,
             stretch_pct=stretch,
             shift=shift,
             horizon_past=horizon_past,
-            horizon_future=horizon_future,
+            horizon_future=HORIZON_FUTURE,
             collapse_overdues=collapse_overdues,
             max_cards_per_day=max_cap,
         )
 
-        matrix_transformed = compute_due_matrix(card_data_transformed, 0)
-        hist_transformed = sum_matrix_columns(matrix_transformed)
-        review_count_label.setText(f"Cards currently in review: {sum(hist_transformed)}")
+        hist = timeline_histogram(state["card_data"])
+        assigned = sum(hist)
+        review_count_label.setText(f"Review cards: {n_review}  (placed: {assigned})")
+        if oldest is not None and n_overdue:
+            overdue_info_label.setText(
+                f"Overdue now: {n_overdue}, oldest {today - oldest} days")
+        else:
+            overdue_info_label.setText("Overdue now: 0")
 
-        # Chart: always show base horizon, stable Y-axis
-        base_horizon = horizon_past + horizon_future
-        chart_hist = hist_transformed[:base_horizon]
-        while len(chart_hist) < base_horizon:
+        # Chart covers the whole simulated timeline (past part is dynamic,
+        # future part may exceed HORIZON_FUTURE after shift / cap).
+        base_range = horizon_past + HORIZON_FUTURE
+        chart_hist = list(hist)
+        while len(chart_hist) < base_range:
             chart_hist.append(0)
 
         # Y-axis stability: only rescale upward when peak > 75% of current max
         current_peak = max(chart_hist) if chart_hist else 0
-        if chart_y_max[0] == 0:
-            # First render: set y_max to peak with 10% headroom
-            chart_y_max[0] = max(1, int(current_peak * 1.1))
-        elif current_peak > chart_y_max[0] * 0.75:
-            # Peak grew beyond 75% of Y-axis: rescale up
-            chart_y_max[0] = max(chart_y_max[0], int(current_peak * 1.1))
-        # Otherwise: keep current y_max (bars shrink within stable axis)
+        if state["y_max"] == 0:
+            state["y_max"] = max(1, int(current_peak * 1.1))
+        elif current_peak > state["y_max"] * 0.75:
+            state["y_max"] = max(state["y_max"], int(current_peak * 1.1))
 
-        labels = [str(i - horizon_past) for i in range(base_horizon)]
-        html = build_chart_html(chart_hist, labels, max_cap=max_cap, y_max=chart_y_max[0])
+        labels = [str(i - horizon_past) for i in range(len(chart_hist))]
+        html = build_chart_html(chart_hist, labels, max_cap=max_cap, y_max=state["y_max"])
         webview.setHtml(html)
 
     def apply_changes():
-        today = date.today()
-        mode = export_mode_select.currentText()
+        # Always simulate from the current widget state; the last preview
+        # may be stale (tags changed, debounce pending, or no preview yet).
+        debounce_timer.stop()
+        update_graph()
+        card_data = state["card_data"]
 
-        changes_preview = []
-        for entry in card_data_transformed:
-            original = entry["original_due"]
-            new = entry["due"]
-            changes_preview.append(f"{{cardID: {entry['cid']}, original: {original}, new: {new}}}")
+        n_changed = sum(1 for c in card_data
+                        if c["type"] == "review" and c["due"] != c["original_due"])
+        if n_changed == 0:
+            QMessageBox.information(dialog_instance, "Nothing to do",
+                                    "No due dates would change with the current settings.")
+            return
 
-        print("\n\nPending changes to be applied:")
-        print("\n".join(changes_preview))
+        reply = QMessageBox.question(
+            dialog_instance,
+            "Review Changes",
+            f"This will rewrite the due date of {n_changed} review cards in the selected"
+            " scope. Undo is possible until you sync. Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
-        if mode == "Write to current deck":
-            reply = QMessageBox.question(
-                dialog_instance,
-                "Review Changes",
-                "You are about to introduce changes into the review data of the selected deck."
-                " Undoing the changes is possible until you sync. Proceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                apply_transformed_due_dates(card_data_transformed)
-                if checkbox_shuffle.isChecked():
-                    shuffle_cards(card_data_transformed)
-                if checkbox_set_new.isChecked():
-                    set_cards_as_new(card_data_transformed)
-                mw.reset()
-                QMessageBox.information(
-                    dialog_instance,
-                    "Success",
-                    "Review dates have been updated. Undo from (Edit > Undo Time Warp)",
-                )
-
-        elif mode == "Create filtered deck":
-            reply = QMessageBox.question(
-                dialog_instance,
-                "Filtered Deck",
-                "Reviewing cards in the filtered deck will introduce permanent changes in their review timeline. Proceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                create_filtered_deck_from_transformed(card_data_transformed)
-                if checkbox_shuffle.isChecked():
-                    shuffle_cards(card_data_transformed)
-                if checkbox_set_new.isChecked():
-                    set_cards_as_new(card_data_transformed)
-                mw.reset()
-                QMessageBox.information(dialog_instance, "Filtered Deck Created", "Filtered deck with transformed due dates has been created.")
+        updated, skipped = apply_transformed_due_dates(card_data, state["horizon_past"])
+        mw.reset()
+        msg = f"{updated} review dates have been updated. Undo via Edit > Undo Time Warp."
+        if skipped:
+            msg += f"\n\nWarning: {skipped} review cards were outside the simulated range and were left untouched."
+        QMessageBox.information(dialog_instance, "Success", msg)
+        update_graph()
 
     def reset_sliders():
         slider_stretch.setValue(0)
         slider_shift.setValue(0)
-        chart_y_max[0] = 0  # reset Y-axis on next render
+        state["y_max"] = 0
 
-    # FIX 3: sliders trigger debounced update, not direct
     debounce_timer.timeout.connect(update_graph)
 
-    slider_stretch.valueChanged.connect(update_labels)
-    slider_shift.valueChanged.connect(update_labels)
     slider_stretch.valueChanged.connect(schedule_update)
     slider_shift.valueChanged.connect(schedule_update)
     max_per_day_spin.valueChanged.connect(schedule_update)
-    deck_select.currentIndexChanged.connect(lambda: (chart_y_max.__setitem__(0, 0), schedule_update()))
+    deck_select.currentIndexChanged.connect(reset_y_axis_and_update)
+    tag_widget.tagChanged.connect(reset_y_axis_and_update)
     checkbox_collapse_overdues.stateChanged.connect(schedule_update)
     preview_btn.clicked.connect(update_graph)       # Preview = immediate
     reset_btn.clicked.connect(reset_sliders)

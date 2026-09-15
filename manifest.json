@@ -2,7 +2,7 @@
   "name": "Anki Time Warp",
   "mod": 0,
   "author": "Deep Intervention",
-  "version": "1.0",
+  "version": "1.1",
   "config": false,
   "description": "Visualize and shift Anki card due dates interactively.",
   "target": "anki22"
